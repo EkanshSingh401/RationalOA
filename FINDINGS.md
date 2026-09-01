@@ -322,3 +322,98 @@ assumptions, not measurements, pending real reviewer data. This study is the
 instrument built to eventually replace them — it doesn't replace them yet,
 because it still assumes the same two catch rates rather than measuring an
 actual human reviewer's behavior.
+
+---
+
+## F6 — The follow-up loop: design summary and the W-9/W-2 denominator asymmetry
+
+Not a measurement like F1–F5 — `w2/chase.py` has no ground truth to score
+itself against yet — but it's the one part of the system whose correctness
+depends entirely on a design decision rather than an arithmetic one, so it
+earns a FINDINGS entry: what the state machine is, and why the completeness
+question it answers has no clean numeric answer the way F1–F4 did.
+
+### The asymmetry that shapes the whole module
+
+Everything upstream (`rules.py`, `evaluate.py`, `seeded_error_study.py`)
+assumes a document is already in hand and asks "is this correct." `chase.py`
+asks the question one layer up: "is this the complete set of documents this
+client should have sent us." That question has a clean answer for a W-9
+pipeline and no clean answer for a W-2 one.
+
+With a W-9, the denominator is a known set: AP has a vendor list, so "did we
+get everyone" is a set difference against a list that already exists. With a
+W-2, there is no equivalent list. If a client sends two W-2s, nothing in
+either document says whether there was a third job — the absence of a
+document is not observable from the documents that did arrive. The
+denominator has to come from somewhere outside the documents themselves, and
+every source for it is weaker than a vendor list:
+
+1. **Prior-year rollforward** (implemented: `rollforward_expectations` +
+   `reconcile`) — chase any EIN present last year, missing this year. Cheap,
+   available in January, correct most of the time. Assumes ~85% returning
+   clients; a client with no prior year has nothing to roll forward.
+2. **IRS Wage & Income transcript** (documented, not implemented) — true
+   ground truth, but gated on a signed Form 8821/2848 and not reliably
+   complete until well after the filing deadline. That timing makes it a
+   post-filing reconciliation and amended-return trigger, not an in-season
+   check — treating it as an in-season signal would be the single biggest
+   available design error here, which is why it's deliberately out of scope
+   for this module rather than half-implemented.
+3. **Secondary signals** (documented, not implemented) — a state return
+   implying wages with no matching federal W-2, an organizer answer, a
+   Box 12 code implying a plan tied to an employer whose W-2 never showed
+   up. Weaker and noisier than rollforward, but catches new employers a
+   prior-year diff structurally cannot.
+
+**New clients have no denominator at all** — no prior year to roll forward,
+usually no transcript authorization yet. The honest answer there is an
+explicit client attestation ("list every employer you had this year"), not
+an inference from any of the three sources above. The failure mode this
+module exists to prevent is silently trusting whatever a new client happens
+to upload as if it were the complete set.
+
+### State machine
+
+10 states (`DocState`), transitions gated through a single `TRANSITIONS`
+table so an illegal move raises `IllegalTransition` instead of silently
+corrupting a document's status. Two invariants worth stating explicitly
+because they contradict the naive version of this state machine:
+
+- **`SIGNED_OFF` is not final.** `SUPERSEDED` is reachable from it, because a
+  W-2c or a clearer scan can arrive after a document has already been
+  approved. Modeling sign-off as terminal would make a real correction
+  unrepresentable.
+- **`ABANDONED` is reversible, back to `RECEIVED`.** A client confirming a
+  job "didn't exist" is itself an unverified claim, not ground truth — the
+  same epistemic status as everything else in the completeness problem this
+  module handles. The state machine has to allow for the client being wrong
+  about their own W-2s, which happens.
+
+### Dedupe
+
+Same `(SSN, EIN, tax_year)` key as `W2Record.key()` (reused, not
+reimplemented), because Copy B, C, and 2 of one W-2 are the same document,
+and a clearer re-upload of an already-received document is too. Kept: the
+copy with the highest mean confidence across `flat_fields()` — reused by
+`reconcile()` before matching, so a re-upload doesn't get counted as a second
+employer on either side of the reconciliation.
+
+### Cadence
+
+Four touches at `[0, 5, 9, 14]` day gaps between successive contacts (≈4
+weeks total), not weekly — chosen because response rates on this kind of
+request collapse and clients start filtering the sender on a weekly cadence.
+`due_for_chase` won't fire before the season starts and stops firing after
+the fourth touch — the design intent past that point is to stop and escalate
+to the human relationship owner, not to keep nagging automatically, so
+`compose_chase` raises rather than silently producing a fifth message.
+
+Every `compose_chase` message, at every tone (friendly → direct → final),
+carries the same non-negotiable content regardless of how urgent the wording
+gets: a secure (`https`) upload link, and an explicit instruction not to
+reply with the document attached. A W-2 in an email body is an SSN plus a
+full wage record in plaintext — GLBA Safeguards Rule and IRS Pub 4557
+territory — so that instruction isn't a style choice, `compose_chase` raises
+`ValueError` on a non-`https` `upload_url` rather than composing a message
+that could be read as inviting an insecure channel.

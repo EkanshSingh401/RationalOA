@@ -3,7 +3,8 @@
 Ingestion → extraction → validation → human review, for a tax-prep firm
 receiving W-2s from clients. Every document gets mandatory human sign-off.
 
-**Status: rule engine, generator, and evaluation harness built and measured.**
+**Status: rule engine, generator, evaluation harness, follow-up loop, and
+downstream export built and measured.**
 This README reports what was built and what the measurements showed. All
 numbers below are pulled from [FINDINGS.md](FINDINGS.md) or are reproducible
 by running the scripts in this repo — none are restated from memory. See
@@ -77,6 +78,38 @@ building:
 
 Build order followed from this: rule engine and evaluation harness first,
 extraction models last and swappable behind one protocol.
+
+---
+
+## Architecture
+
+```
+w2/
+  constants.py   per-tax-year IRS tables: wage base, 402(g), catch-ups,
+                 valid Box 12 codes, no-income-tax states
+  schema.py      canonical record -- every value carries confidence, source,
+                 and a bbox (the Field wrapper)
+  datasets.py    HF loader, gt_parse -> canonical schema adapter (F1)
+  generate.py    payroll-consistent synthetic W-2 generator (F2)
+  rules.py       declarative validation rules with severity and tolerance (F2)
+  backends.py    Backend protocol + 3 simulated extraction arms (F3)
+  evaluate.py    paired shadow-eval harness, reviewer model, risk-coverage (F3)
+  chase.py       follow-up loop: state machine, completeness denominator,
+                 chase cadence (F6)
+  output.py      downstream export: CSV + provenance-carrying JSON, gated
+                 on SIGNED_OFF (see "Downstream output" below)
+scripts/
+  check_dataset_consistency.py   Experiment 0 (F1)
+  score_public_dataset.py        rule engine fire rates on the public corpus (F2)
+  run_eval.py                    extraction-arm comparison (F3)
+  seeded_error_study.py          rule-engine coverage study (F4)
+  export.py                      CLI demo of the CSV/JSON export + sign-off gate
+tests/
+  test_schema.py, test_rules.py, test_evaluate.py, test_chase.py, test_output.py
+```
+
+Not yet built: real extraction backends behind `Backend`, and the other
+items in "Known gaps" below.
 
 ---
 
@@ -262,6 +295,90 @@ Neither bug was caught by eyeballing output that looked reasonable — both
 were caught by asking what denominator a ratio actually used and checking it
 against a hand-built case with a known answer.
 
+### F6 — The follow-up loop: design summary, not a measurement
+
+Unlike F1–F5, this isn't a measurement — `w2/chase.py` has no ground truth
+to score itself against yet. It's the one part of the system whose
+correctness rests on a design decision rather than an arithmetic one, so it
+gets a findings entry anyway: what the state machine is, and why the
+completeness question it answers has no clean numeric answer the way F1–F4
+did.
+
+Everything upstream assumes a document is already in hand and asks "is this
+correct." `chase.py` asks the question one layer up: "is this the complete
+set of documents this client should have sent us." A W-9 pipeline has a
+clean answer — AP has a vendor list, so "did we get everyone" is a set
+difference. A W-2 pipeline doesn't: if a client sends two W-2s, nothing in
+either document says whether there was a third job. The denominator has to
+come from outside the documents themselves, and every source for it is
+weaker than a vendor list — see "Completeness has no denominator" under
+Assumptions below for the three sources and why only the first is
+implemented.
+
+Two invariants in the state machine (`DocState` + `TRANSITIONS`) are worth
+calling out because they contradict the naive version of this design:
+**`SIGNED_OFF` is not final** — `SUPERSEDED` is reachable from it, because a
+W-2c or a clearer scan can arrive after approval, and modeling sign-off as
+terminal would make a real correction unrepresentable. **`ABANDONED` is
+reversible**, back to `RECEIVED` — a client confirming a job "didn't exist"
+is an unverified claim, not ground truth, and the state machine has to allow
+for the client being wrong about their own W-2s.
+
+`dedupe()` reuses `W2Record.key()` and feeds `reconcile()`, so a re-uploaded
+or clearer-photo copy of a document doesn't get counted as a second employer
+on either side of the reconciliation. Chase cadence is four touches at
+`[0, 5, 9, 14]`-day gaps (~4 weeks total), not weekly, because response
+rates on this kind of request collapse and clients start filtering the
+sender on a weekly cadence — and it stops after the fourth touch rather than
+continuing indefinitely; `compose_chase` raises rather than compose a fifth
+message, and the design intent past that point is to escalate to the human
+relationship owner. Every message, at every tone, carries the same
+non-negotiable content: a secure (`https`) upload link and an explicit
+instruction not to reply with the document attached — `compose_chase` raises
+on a non-`https` `upload_url` rather than risk composing a message that
+could read as inviting an insecure channel.
+
+---
+
+## Downstream output
+
+`w2/output.py` (CLI: `scripts/export.py`) is the last stage: taking
+SIGNED_OFF `W2Record`s and emitting them as a flat CSV (decimal-dollar
+columns, meant for direct downstream import) or a JSON export that keeps
+every value in its `Field` wrapper — confidence, source, bbox — plus the
+rule findings computed fresh at export time.
+
+**The sign-off gate is an enforced invariant, not a policy described in
+prose.** Every other module assumes a human looks at a document before it
+goes anywhere; `output.py` is where that assumption becomes a mechanical
+property of the code. Both `export_csv()` and `export_json()` check each
+record's `DocState` (F6) and raise `NotSignedOff` — naming the offending
+`doc_id` and its actual state — on the first record that isn't
+`SIGNED_OFF`, rather than silently skipping it or exporting it anyway. A
+batch is validated in full before anything is written, so a bad record
+later in the list can't leave a partial export sitting on disk.
+
+A second, narrower check: `rules.validate` is re-run at export time rather
+than trusting whatever findings existed when a human signed off, because a
+human can approve in error and this is the last place in the pipeline that
+can still catch it. The two formats respond differently on purpose — CSV
+raises `UnresolvedCriticalFindings` and refuses outright, since a flat row
+headed for a downstream import has no column to carry a warning in; JSON
+still exports the record but sets `has_unresolved_critical_findings` at the
+top level of that document's entry and carries the full finding list,
+because hiding the exceptional case from the one export meant to be an
+audit trail would defeat its purpose.
+
+Money is decimal dollars in the CSV (what a downstream consumer expects)
+and stays integer cents in the JSON (untouched, since anything reading the
+JSON already speaks this project's schema). A real integration targets the
+tax software's own import schema (Drake, UltraTax, Lacerte, etc.), not this
+module's CSV/JSON shape directly — that's a deliberate, narrow adapter
+written against `export_csv`/`export_json`'s output, which is the reason
+the canonical `W2Record`/`Field` schema exists in the first place: adapting
+to one more downstream format is a small translation layer, not a rewrite
+of everything upstream of it.
+
 ---
 
 ## What's measured vs. what's assumed
@@ -309,19 +426,26 @@ money and introduce errors that were never in the document.
 **Completeness has no denominator, unlike a W-9.** With W-9s, AP has a vendor
 list — the firm knows who owes a form. With W-2s there's no such list: if a
 client sends two, nothing says whether there was a third job. Three sources,
-descending reliability: (1) IRS Wage & Income transcript — true ground truth,
-but not reliably complete until well after the filing deadline, so it's a
-post-filing reconciliation trigger, not an in-season check; (2) prior-year
-rollforward — cheap, available in January, the in-season workhorse, assumes
-~85% returning clients; (3) secondary signals (a state return implying wages
-not on file, a Box 12 code implying an unmentioned plan).
+descending reliability: (1) prior-year rollforward — cheap, available in
+January, the in-season workhorse, assumes ~85% returning clients, and the
+only one of the three actually implemented (`rollforward_expectations` +
+`reconcile` in `w2/chase.py`, see F6); (2) IRS Wage & Income transcript —
+true ground truth, but not reliably complete until well after the filing
+deadline, so it's a post-filing reconciliation trigger, not an in-season
+check; (3) secondary signals (a state return implying wages not on file, a
+Box 12 code implying an unmentioned plan). Both (2) and (3) are documented
+in `w2/chase.py`'s module docstring but deliberately not implemented.
 
 **Security is non-negotiable.** Every W-2 is an SSN plus a full wage record —
 GLBA Safeguards Rule and IRS Pub 4557 apply. Follow-up always directs to a
-secure upload link, never an email attachment; any third-party model API
-touching document images needs zero-retention terms in writing first;
-field-level provenance (the `Field` wrapper's `source`) exists so a bad model
-version's blast radius is answerable after the fact.
+secure upload link and never invites an email attachment — enforced, not
+just stated: `compose_chase` (`w2/chase.py`, F6) raises on a non-`https`
+upload link, and every message it produces carries the same no-attachment
+line regardless of tone. Any third-party model API touching document images
+needs zero-retention terms in writing first; field-level provenance (the
+`Field` wrapper's `source`) exists so a bad model version's blast radius is
+answerable after the fact, and carries through unmodified into the JSON
+export (see "Downstream output").
 
 ---
 
@@ -353,12 +477,8 @@ priori guessing:
    question — does a real hosted API or a real VLM actually produce that
    inversion — needs `extract(image)` implementations. The harness is
    already built to swap them in with no other change.
-5. **`chase.py`** — the document state machine and follow-up cadence
-   (`EXPECTED → REQUESTED → RECEIVED → EXTRACTED → FLAGGED →
-   READY_FOR_REVIEW → SIGNED_OFF`, plus `SUPERSEDED`/`ABANDONED`) and the
-   completeness reconciliation logic. Not started.
-6. **W-2c corrections and 4-up copy-sheet segmentation.** Out of scope for
+5. **W-2c corrections and 4-up copy-sheet segmentation.** Out of scope for
    v1; `SUPERSEDED` exists as a state but the parser doesn't.
-7. **W-3/941 cross-document reconciliation.** Only relevant if the firm also
+6. **W-3/941 cross-document reconciliation.** Only relevant if the firm also
    runs payroll for clients — a different reading of "direction of flow"
    than the one this project assumes.
