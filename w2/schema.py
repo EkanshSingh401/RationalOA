@@ -6,6 +6,7 @@ key on their natural key (code / state abbreviation), never position, so
 a dropped row never shifts the identity of the rows around it.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,6 +59,7 @@ class W2Record:
     allocated_tips_box8: Optional[Field] = None
     dependent_care_box10: Optional[Field] = None
     nonqualified_plans_box11: Optional[Field] = None
+    box13_retirement_plan: Optional[Field] = None
     box12: List[Box12Entry] = field(default_factory=list)
     state_rows: List[StateRow] = field(default_factory=list)
 
@@ -71,6 +73,17 @@ class W2Record:
         Repeated rows use natural keys (box12[<code>]_amount,
         state[<abbr>]_box17_tax, ...) instead of position, so a dropped
         row never shifts another row's key.
+
+        A Box 12 code can legitimately repeat (P, L), and some data
+        sources duplicate codes that shouldn't (see BOX12_DUPLICATE_CODE).
+        Either way, every entry must still get its own key or amounts
+        silently disappear from anything scored off this dict. Within a
+        duplicated code, entries are ordered by amount descending -- not
+        source/slot order, since Box 12 slot position (12a-12d) carries
+        no meaning and an extractor returning the same rows in a
+        different order must not count as an error -- and numbered
+        box12[<code>#1]_amount, box12[<code>#2]_amount, ... A code that
+        appears once keeps the plain box12[<code>]_amount form.
         """
         flat: Dict[str, Field] = {
             "ssn": self.ssn,
@@ -91,14 +104,26 @@ class W2Record:
             "allocated_tips_box8": self.allocated_tips_box8,
             "dependent_care_box10": self.dependent_care_box10,
             "nonqualified_plans_box11": self.nonqualified_plans_box11,
+            "box13_retirement_plan": self.box13_retirement_plan,
         }
         for name, f in optional_fields.items():
             if f is not None:
                 flat[name] = f
 
+        by_code: Dict[Any, List[Box12Entry]] = defaultdict(list)
         for entry in self.box12:
-            code = entry.code.value
-            flat[f"box12[{code}]_amount"] = entry.amount
+            by_code[entry.code.value].append(entry)
+
+        for code, entries in by_code.items():
+            if len(entries) == 1:
+                flat[f"box12[{code}]_amount"] = entries[0].amount
+                continue
+            ordered = sorted(
+                entries,
+                key=lambda e: (e.amount.value is None, -(e.amount.value or 0)),
+            )
+            for i, entry in enumerate(ordered, start=1):
+                flat[f"box12[{code}#{i}]_amount"] = entry.amount
 
         for row in self.state_rows:
             state = row.state.value

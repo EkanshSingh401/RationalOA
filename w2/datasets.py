@@ -62,6 +62,13 @@ def _money_field(record: Dict[str, Any], key: str, source: str = "gt_parse") -> 
     return Field(value=cents, confidence=1.0, source=source, bbox=None)
 
 
+def _checkbox_field(record: Dict[str, Any], key: str, source: str = "gt_parse") -> Field:
+    """Box 13 checkboxes: "x" means checked, the "None" sentinel means blank."""
+    raw = record[key]
+    checked = not _is_none(raw) and str(raw).strip().lower() == "x"
+    return Field(value=checked, confidence=1.0, source=source, bbox=None)
+
+
 def from_gt_parse(record: Dict[str, Any], tax_year: int, source: str = "gt_parse") -> W2Record:
     """Adapt one gt_parse dict to a W2Record.
 
@@ -107,6 +114,7 @@ def from_gt_parse(record: Dict[str, Any], tax_year: int, source: str = "gt_parse
         allocated_tips_box8=_money_field(record, "box_8_allocated_tips", source=source),
         dependent_care_box10=_money_field(record, "box_10_dependent_care_benefits", source=source),
         nonqualified_plans_box11=_money_field(record, "box_11_nonqualified_plans", source=source),
+        box13_retirement_plan=_checkbox_field(record, "box_13_retirement_plan", source=source),
         box12=box12,
         state_rows=state_rows,
     )

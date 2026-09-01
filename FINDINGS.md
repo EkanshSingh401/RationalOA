@@ -124,9 +124,99 @@ table to load — so a dataset omitting it cannot exercise that path at all.
 
 ---
 
-## F3 — (reserved) Rule engine false-positive rate on clean synthetic data
+## F3 — Rule engine: false-positive rate on clean data, true-positive rate on the public corpus
 
-Acceptance target: zero findings across 3,000 generated documents.
+**Acceptance target:** zero findings across a few thousand generated documents
+(README, "Secondary: the payroll-consistent generator").
+
+### Result: 48/48 tests passing, zero findings on generated data
+
+Zero findings across **23,000 generated documents spanning 21 seeds** — the
+pinned 3,000-document acceptance test (seed 42) plus a 20×1,000 stress sweep
+(seeds 0–19), re-verified after the two fixes below.
+
+### Two bugs found and fixed, from two different sources
+
+**1. Generator: degenerate Box 1, caught directly by the acceptance test.**
+`_generate_box12` sized the 402(g) deferral budget off the year's dollar limit
+alone, with no regard for how small `gross` was. A low-earner record could be
+assigned a near-max deferral, and the negative-Box-1 backstop clamped it to a
+technically-non-negative but degenerate ~$0.01 Box 1 — which then tripped
+`STATE_WAGES_OUT_OF_BAND` when the record was validated. Fixed by capping the
+deferral budget at half of available wages, not just the 402(g) limit, so the
+backstop clamp is now essentially never exercised instead of being load-bearing.
+
+**2. Schema: `flat_fields()` Box 12 collision, an evaluation-integrity bug,
+not caught by the acceptance test.** The generator only ever emits distinct
+Box 12 codes (`rng.sample`, no replacement), so this could never surface
+there — it was flagged during rule design (writing `BOX12_DUPLICATE_CODE`)
+and confirmed materially real by scoring the public corpus, where 611/2,000
+records duplicate a code (three `E` entries is common). `flat_fields()` kept
+one dict entry per *code*, so a duplicated code silently dropped every entry
+but the last — which matters beyond labeling, because `flat_fields()` is what
+an eval harness diffs truth against prediction on: two real amounts would
+never enter the denominator, and a score computed against a shrunk
+denominator looks better than it is. Fixed by numbering entries within a
+duplicated code (`box12[E#1]_amount`, `box12[E#2]_amount`, ...), ordered by
+amount descending rather than source order, since Box 12 slot position
+(12a–12d) carries no meaning and an extractor returning the same rows in a
+different order must not be scored as an error. A code appearing once keeps
+the plain `box12[<code>]_amount` form.
+
+Also removed the second clause of `BOX3_EXCEEDS_BOX1_UNEXPLAINED`
+("Box 3 above Box 1 and above the wage base cannot occur"): if Box 3 exceeds
+the wage base then Box 3 + Box 7 also does (Box 7 >= 0), so
+`SS_WAGE_BASE_EXCEEDED` already fires on every record that clause would have
+caught. It only added a duplicate finding on the same underlying defect —
+inflating flag counts and charging the reviewer real time for a box they were
+already sent to. Measured effect on the public corpus: 924/2,000 (46.2%) to
+901/2,000 (45.1%) — 23 records had been flagged by that clause alone.
+
+### Public-dataset fire rates (`scripts/score_public_dataset.py`, post-fix)
+
+| Rule | Severity | Fire rate |
+|---|---|---|
+| `SS_TAX_MISMATCH` | CRITICAL | 2000/2000 (100.0%) |
+| `MEDICARE_TAX_MISMATCH` | CRITICAL | 2000/2000 (100.0%) |
+| `SS_WAGE_BASE_EXCEEDED` | CRITICAL | 1549/2000 (77.5%) |
+| `BOX5_BOX1_UNEXPLAINED` | ERROR | 2000/2000 (100.0%) |
+| `BOX1_EXCEEDS_BOX5` | CRITICAL | 1045/2000 (52.2%) |
+| `BOX3_EXCEEDS_BOX1_UNEXPLAINED` | ERROR | 901/2000 (45.1%) |
+| `NEGATIVE_AMOUNT` | CRITICAL | 0/2000 (0.0%) |
+| `FED_TAX_EXCEEDS_WAGES` | CRITICAL | 0/2000 (0.0%) |
+| `SSN_MALFORMED` | CRITICAL | 0/2000 (0.0%) |
+| `SSN_INVALID_AREA` | CRITICAL | 0/2000 (0.0%) |
+| `SSN_INVALID_GROUP_SERIAL` | CRITICAL | 0/2000 (0.0%) |
+| `EIN_MALFORMED` | CRITICAL | 0/2000 (0.0%) |
+| `BOX12_INVALID_CODE` | ERROR | 0/2000 (0.0%) |
+| `BOX12_OVER_402G` | WARN | 0/2000 (0.0%) |
+| `BOX12_DUPLICATE_CODE` | WARN | 611/2000 (30.6%) |
+| `BOX13_RETIREMENT_INCONSISTENT` | WARN | 1238/2000 (61.9%) |
+| `NO_TAX_STATE_WITHHOLDING` | ERROR | 701/2000 (35.0%) |
+| `STATE_WAGES_OUT_OF_BAND` | WARN | 0/2000 (0.0%) |
+| `STATE_TAX_IMPLAUSIBLE` | ERROR | 0/2000 (0.0%) |
+
+`SS_WAGE_BASE_EXCEEDED` at 77.5% is not the ~35% Box 3 alone would suggest
+(and did suggest, in F1's threshold table). The rule checks Box 3 + Box 7 per
+spec, and Box 7 is set identically equal to Box 3 in every record (F1's
+tips-duplication artifact), so the checked total is effectively 2x Box 3 —
+roughly doubling the fire rate. A rule-input artifact carried over from F1,
+not a new rule bug.
+
+`BOX1_EXCEEDS_BOX5` at 52.2% is a near-coin-flip. That's independent
+confirmation — from the rule-firing side rather than the correlation-and-sign
+analysis F1 used — of the same conclusion: Box 1 and Box 5 are not derived
+from each other in this dataset, they're drawn independently, so which one
+happens to be larger is close to a fair coin.
+
+Every identifier/format rule (`SSN_MALFORMED`, `SSN_INVALID_AREA`,
+`SSN_INVALID_GROUP_SERIAL`, `EIN_MALFORMED`, `BOX12_INVALID_CODE`,
+`BOX12_OVER_402G`, `STATE_WAGES_OUT_OF_BAND`, `STATE_TAX_IMPLAUSIBLE`) sits at
+0%, because Faker produces well-formed SSNs and EINs and stays within
+realistic Box 12 magnitudes and state-wage ratios. Net effect: this public
+corpus exercises and validates the arithmetic layer of the rule set and
+essentially nothing else — the identifier and structural rules are unproven
+against real-world malformed input by this corpus alone.
 
 ## F4 — (reserved) Extraction arm comparison
 
