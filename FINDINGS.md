@@ -218,6 +218,107 @@ corpus exercises and validates the arithmetic layer of the rule set and
 essentially nothing else — the identifier and structural rules are unproven
 against real-world malformed input by this corpus alone.
 
-## F4 — (reserved) Extraction arm comparison
+## F4 — Extraction arm comparison: a calibration inversion, and cost bought with escapes
 
-## F5 — (reserved) Seeded-error study: measured value of the rule engine
+**Corpus:** 2,000 documents from `w2.generate` (seed 2024), scored paired across
+three simulated backends (`w2.backends.ARMS`) via `scripts/run_eval.py`. Ground
+truth is the generator, not the public corpus — the public corpus's own known
+FICA defects (F1) would make the rule engine fire regardless of extraction
+quality, which is useless for measuring extraction-arm differences.
+
+| ARM | FIELD ACC | CRIT ACC | ESC/DOC | REV MIN | COST | P95 LAT | RC-AUC |
+|---|---|---|---|---|---|---|---|
+| `hosted_prebuilt` | 98.4% | 97.6% | 0.170 | 1.78m | $1.50 | 1217ms | 0.0003 |
+| `vlm_structured` | 99.0% | 98.7% | 0.104 | 1.68m | $4.00 | 2628ms | 0.0022 |
+| `template_ocr` | 95.5% | 93.5% | 0.469 | 2.25m | $0.05 | 301ms | 0.0020 |
+
+ESC/DOC is `expected_escapes / n_docs` (see `w2/evaluate.py` module docstring for
+why this and not the dollar-weighted ratio is the headline — F5 shows the same
+lesson from the other direction). RC-AUC is area under the risk-coverage curve;
+lower means confidence actually separates that arm's own right answers from its
+wrong ones.
+
+### The calibration inversion
+
+`vlm_structured` has the highest field accuracy of the three (99.0%) but the
+worst RC-AUC (0.0022, ~7x `hosted_prebuilt`'s 0.0003). Its confidence barely
+separates correct from incorrect fields, so a threshold on its own confidence
+can't be trusted to prioritize review. `find_calibration_inversions` (called
+inside `run_eval.py`) confirms this is a strict inversion against both other
+arms: higher field accuracy, worse RC-AUC. Under mandatory sign-off, confidence
+is what rations reviewer attention, so selecting `vlm_structured` on field
+accuracy alone picks the wrong arm.
+
+### The cost tradeoff, stated explicitly
+
+`template_ocr` costs $0.05/doc against `vlm_structured`'s $4.00/doc — **80x
+cheaper** — and buys that with 0.469 − 0.104 = **0.365 additional escaped
+errors per document**. Per-error escape probability is similar across all three
+arms (51.2–52.1%, driven by the same two reviewer constants), so the ESC/DOC
+gap is almost entirely a volume effect: `template_ocr` simply produces far more
+material errors per document (1,814 vs. 400 over the same 2,000 docs), not a
+worse per-error catch rate. This is the reason ESC/DOC has to be the headline
+and not the dollar-weighted ratio (F5's Box 2 result is the same lesson again):
+the dollar-weighted view came out at 20.3–20.4% for all three arms and made
+them look interchangeable on escape risk, which they are not.
+
+---
+
+## F5 — Seeded-error study: measured value of the rule engine
+
+**Method:** `scripts/seeded_error_study.py`, 8,000 `w2.generate` documents
+(seed 777), exactly one injected error per document (digit transposition, OCR
+confusion, decimal shift, or a fully dropped field), drawn across Box 1–6 and
+SSN/EIN. Flag rate — does `rules.validate` flag the corrupted field — is
+measured directly. Escape rate layers the same two `REVIEWER_CATCH_RATE_*`
+assumptions from `w2/evaluate.py` on top.
+
+| FIELD | N | FLAG RATE | ESCAPE RATE |
+|---|---|---|---|
+| wages_box1 | 905 | 96.0% | 20.0% |
+| **fed_income_tax_box2** | 996 | **13.7%** | 25.5% |
+| ss_wages_box3 | 948 | 96.7% | 20.0% |
+| ss_tax_box4 | 953 | 95.2% | 20.0% |
+| medicare_wages_box5 | 994 | 97.1% | 20.0% |
+| medicare_tax_box6 | 945 | 92.6% | 20.0% |
+| **ssn** | 1116 | 56.4% | 46.2% |
+| ein | 1143 | 53.5% | 47.9% |
+
+Flag rate is the coverage metric to read, not escape rate — and Box 2 is the
+demonstration why. Its escape rate (25.5%) looks unremarkable, even better than
+SSN's (46.2%), which would suggest Box 2 is fine. Breaking Box 2 down by
+corruption type shows that's an artifact of dollar-weighting:
+
+| corruption type | n | flag rate | mean materiality |
+|---|---|---|---|
+| decimal_shift | 303 | 44.2% | $759,960.87 |
+| dropped_field | 291 | 0.0% | $33,841.92 |
+| ocr_confusion | 111 | 0.9% | $10,085.29 |
+| digit_transposition | 291 | 0.3% | $10,235.52 |
+
+Decimal-shift Box 2 errors average $759,961 in apparent size and get caught
+44.2% of the time — they blow past Box 1 and trip `FED_TAX_EXCEEDS_WAGES`. The
+other three corruption types are still real $10–34k mistakes and get caught
+0.0–0.9% of the time. The rare, huge, easily-caught decimal-shift errors
+dominate the dollar-weighted average and hide that the ordinary case — a
+transposed or OCR-confused or dropped Box 2 — survives review essentially every
+time it happens.
+
+**Ranked by flag rate (ascending), the three worst-covered fields are
+`fed_income_tax_box2` (13.7%), `ein` (53.5%), `ssn` (56.4%)** — dramatically
+worse than every arithmetic-linked money field (92.6–97.1%). This empirically
+confirms, for the first time rather than by reasoning about it, both gaps the
+original spec called out: "Box 2 is invisible to arithmetic" and "SSN
+structural validation catches almost nothing."
+
+### What this study is and isn't
+
+Flag rates in both tables above are measured — real output of
+`rules.validate` on real corrupted records, no assumption involved. Escape
+rates are still projections: they're flag rate run through
+`REVIEWER_CATCH_RATE_FLAGGED` (0.80) and `REVIEWER_CATCH_RATE_UNFLAGGED`
+(0.20), two constants at the top of `w2/evaluate.py` that are stated
+assumptions, not measurements, pending real reviewer data. This study is the
+instrument built to eventually replace them — it doesn't replace them yet,
+because it still assumes the same two catch rates rather than measuring an
+actual human reviewer's behavior.

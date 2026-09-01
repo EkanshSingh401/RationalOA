@@ -18,10 +18,37 @@ automation bias: a reviewer facing a rule-flagged field reads it
 carefully and catches most errors; a reviewer facing an unflagged field
 in an otherwise-clean-looking form catches few. These two numbers are
 ASSUMPTIONS, not measurements -- they are the least defensible numbers
-in the project, and they drive materiality_weighted_escape_rate below.
-scripts/seeded_error_study.py exists to replace them with measured
-values; until that's done, treat every escape-rate number here as
-conditional on these constants being roughly right.
+in the project. scripts/seeded_error_study.py exists to replace them
+with measured values; until that's done, treat every escape number here
+as conditional on these constants being roughly right.
+
+--- Escape metrics: three views, different denominators ---
+
+expected_escapes is a raw count: the expected number of material errors
+(materiality >= MATERIALITY_THRESHOLD_CENTS) that survive review under
+the reviewer model above. It's an expectation, not a stochastic count --
+REVIEWER_CATCH_RATE_* are probabilities, summed rather than sampled, so
+the number can be fractional (e.g. 187.3 expected escapes).
+
+  - escape_rate_per_document = expected_escapes / n_docs.
+    THE HEADLINE. "How many material errors survive review, per
+    document scored" -- comparable across arms with different error
+    rates or different documents-per-arm, and answers the question the
+    README actually cares about (reviewer-minutes and escape rate are
+    both per-document quantities).
+  - escape_rate_per_error = expected_escapes / n_material_errors.
+    Secondary. "Given a material error occurred, what's its average
+    chance of surviving review" -- unweighted by dollar size.
+  - materiality_weighted_escape_rate = sum(materiality_i * escape_prob_i)
+    / sum(materiality_i), i.e. denominator is total dollars in material
+    errors, NOT n_docs and NOT n_material_errors. Secondary diagnostic:
+    "of the dollars at risk, what fraction escape." Kept because it's a
+    real question, but it can disagree sharply with escape_rate_per_error
+    when a few huge, easily-caught errors dominate the dollar total and
+    mask that most individual errors of that type go uncaught -- this
+    happened with Box 2 decimal-shift errors in the seeded-error study
+    (see scripts/seeded_error_study.py's Box 2 / SSN section) and is
+    exactly why this is not the headline.
 """
 
 import statistics
@@ -216,7 +243,14 @@ class ArmReport:
     n_docs: int
     field_accuracy: float
     critical_field_accuracy: float
-    materiality_weighted_escape_rate: float
+    n_material_errors: int
+    expected_escapes: float                # raw count (expected value, not a materiality-weighted probability)
+    escape_rate_per_document: float        # HEADLINE: expected_escapes / n_docs
+    escape_rate_per_error: float           # secondary: expected_escapes / n_material_errors (unweighted)
+    materiality_weighted_escape_rate: float  # secondary: same ratio as before -- dollar-weighted, denominator is
+                                              # sum(materiality of material errors), NOT n_docs and NOT a plain
+                                              # error count. Kept because "what fraction of dollars at risk
+                                              # escape" is a real question; just not the headline anymore.
     materiality_at_risk_cents: int
     reviewer_minutes_per_doc: float
     mean_cost_cents: float
@@ -240,8 +274,18 @@ def summarize_arm(name: str, docs: List[DocScore]) -> ArmReport:
     n_critical_correct = sum(1 for fs in critical_scores if fs.correct)
 
     material_errors = [fs for fs in all_scores if not fs.correct and fs.materiality >= MATERIALITY_THRESHOLD_CENTS]
-    escape_numerator = sum(fs.materiality * _escape_probability(fs.flagged) for fs in material_errors)
-    escape_denominator = sum(fs.materiality for fs in material_errors)
+    n_material_errors = len(material_errors)
+
+    # expected_escapes is a raw count (expected value under the reviewer model,
+    # since REVIEWER_CATCH_RATE_* are probabilities, not a stochastic draw per error).
+    escape_probs = [_escape_probability(fs.flagged) for fs in material_errors]
+    expected_escapes = sum(escape_probs)
+
+    # Dollar-weighted view: same ratio the module used to call the headline.
+    # Denominator is sum(materiality), NOT n_docs and NOT n_material_errors --
+    # kept as a secondary diagnostic, see the ArmReport field comment.
+    mat_numerator = sum(fs.materiality * prob for fs, prob in zip(material_errors, escape_probs))
+    mat_denominator = sum(fs.materiality for fs in material_errors)
 
     reviewer_minutes = statistics.mean(
         REVIEWER_BASE_MINUTES + REVIEWER_MINUTES_PER_FLAGGED_FIELD * d.num_flagged for d in docs
@@ -261,8 +305,12 @@ def summarize_arm(name: str, docs: List[DocScore]) -> ArmReport:
         n_docs=len(docs),
         field_accuracy=n_correct / n_fields if n_fields else 0.0,
         critical_field_accuracy=n_critical_correct / len(critical_scores) if critical_scores else 0.0,
-        materiality_weighted_escape_rate=(escape_numerator / escape_denominator) if escape_denominator else 0.0,
-        materiality_at_risk_cents=int(escape_denominator),
+        n_material_errors=n_material_errors,
+        expected_escapes=expected_escapes,
+        escape_rate_per_document=(expected_escapes / len(docs)) if docs else 0.0,
+        escape_rate_per_error=(expected_escapes / n_material_errors) if n_material_errors else 0.0,
+        materiality_weighted_escape_rate=(mat_numerator / mat_denominator) if mat_denominator else 0.0,
+        materiality_at_risk_cents=int(mat_denominator),
         reviewer_minutes_per_doc=reviewer_minutes,
         mean_cost_cents=mean_cost,
         p95_latency_ms=p95_latency,

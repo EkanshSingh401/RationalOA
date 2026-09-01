@@ -51,7 +51,7 @@ def main() -> None:
     print(f"Materiality threshold: errors under ${MATERIALITY_THRESHOLD_CENTS/100:.2f} are not escapes.")
     print()
 
-    header = (f"{'ARM':16s} {'FIELD ACC':>10s} {'CRIT ACC':>9s} {'ESCAPE%':>8s} "
+    header = (f"{'ARM':16s} {'FIELD ACC':>10s} {'CRIT ACC':>9s} {'ESC/DOC':>8s} "
               f"{'REV MIN':>8s} {'COST':>8s} {'P95 LAT':>9s} {'RC-AUC':>9s}")
     print(header)
     print("-" * len(header))
@@ -60,11 +60,25 @@ def main() -> None:
         cost = "$" + format(r.mean_cost_cents / 100, ".2f")
         latency = f"{r.p95_latency_ms:.0f}ms"
         print(f"{name:16s} {r.field_accuracy:>10.1%} {r.critical_field_accuracy:>9.1%} "
-              f"{r.materiality_weighted_escape_rate:>8.1%} {rev_min:>8s} "
+              f"{r.escape_rate_per_document:>8.3f} {rev_min:>8s} "
               f"{cost:>8s} {latency:>9s} {r.rc_auc:>9.4f}")
     print()
+    print("ESC/DOC (headline): expected_escapes / n_docs -- material errors surviving review, per document.")
     print("RC-AUC: lower is better (area under the risk-coverage curve -- risk stays low longer")
     print("as low-confidence fields are set aside first, when confidence actually separates errors).")
+    print()
+
+    print("=" * 100)
+    print("Escape rate -- three views, see w2/evaluate.py docstring for what each denominator means")
+    print("=" * 100)
+    sec_header = (f"{'ARM':16s} {'N ERRORS':>9s} {'ESCAPES':>9s} {'ESC/DOC':>9s} "
+                  f"{'ESC/ERROR':>10s} {'$-WEIGHTED':>11s}")
+    print(sec_header)
+    print("-" * len(sec_header))
+    for name, r in reports.items():
+        print(f"{name:16s} {r.n_material_errors:>9d} {r.expected_escapes:>9.1f} "
+              f"{r.escape_rate_per_document:>9.3f} {r.escape_rate_per_error:>10.1%} "
+              f"{r.materiality_weighted_escape_rate:>11.1%}")
     print()
 
     inversions = find_calibration_inversions(reports)

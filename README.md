@@ -1,359 +1,357 @@
 # W-2 automation pipeline
 
-Ingestion → extraction → validation → human review → downstream output, for a tax
-preparation firm receiving W-2s from clients.
+Ingestion → extraction → validation → human review, for a tax-prep firm
+receiving W-2s from clients. Every document gets mandatory human sign-off.
 
-This README is the spec.
-Everything below is a decision I made and can defend; "Open questions" at the
-bottom lists what I would change my mind about given real data.
+**Status: rule engine, generator, and evaluation harness built and measured.**
+This README reports what was built and what the measurements showed. All
+numbers below are pulled from [FINDINGS.md](FINDINGS.md) or are reproducible
+by running the scripts in this repo — none are restated from memory. See
+FINDINGS.md for full detail and methodology behind each result.
+
+The single most important finding: the public benchmark dataset this project
+was built around is arithmetically fake in specific, measurable ways — Box 4
+is 7.65% of Box 3, not the correct 6.2%, and there is no Social Security wage
+base cap at all (F1). That single fact drove most of what follows: it's why a
+payroll-consistent generator had to be built before the rule engine could be
+tested against anything, and why the extraction-arm comparison runs against
+that generator rather than the public corpus.
+
+---
+
+## Quickstart
+
+```bash
+git clone <this-repo> && cd RationalOA
+pip install -r requirements.txt
+pytest
+```
+
+56 tests, no network access required except the two commands below that load
+the Hugging Face dataset.
+
+```bash
+# Experiment 0: is the public dataset's arithmetic internally consistent?
+python3 scripts/check_dataset_consistency.py
+
+# Rule engine fire rates across all 2,000 public-dataset records
+python3 scripts/score_public_dataset.py
+
+# Extraction-arm comparison (paired shadow eval, 3 simulated backends)
+python3 scripts/run_eval.py [n_docs] [seed]      # default 2000 2024
+
+# Seeded-error study: rule-engine coverage per field and corruption type
+python3 scripts/seeded_error_study.py [n_docs] [seed]   # default 8000 777
+```
+
+The first two download the HF dataset on first run (`datasets` caches it
+locally after that). The last two use only the local generator — no network
+needed.
 
 ---
 
 ## The thesis
 
-Every W-2 gets human sign-off by design. That single constraint reshapes the
-project:
+Every W-2 gets human sign-off by design. That constraint reshapes what's worth
+building:
 
-- **Straight-through-processing rate is meaningless here.** It is zero on purpose.
-  What matters is reviewer-minutes per document and materiality-weighted escape
-  rate — errors that survive a reviewer who was already looking at the document.
-- **Extraction is commodity.** Azure Document Intelligence, Google Document AI, and
-  AWS Textract all ship prebuilt US tax form models covering W-2. Rebuilding that
-  is a poor use of early engineering time.
-- **The validation layer is the defensible work.** A W-2 is an over-determined
-  system: Box 4 is 6.2% of Box 3, Box 6 follows from Box 5, and Box 5 minus Box 1
-  must be explained by Box 12 deferral codes. That arithmetic gives a correctness
-  signal on *unlabeled production data* with no ground truth required — which is
-  what you monitor on, and what points a reviewer's attention at the right box.
+- **Straight-through-processing rate is meaningless here.** It's zero on
+  purpose. What matters is reviewer-minutes per document and escapes per
+  document — errors that survive a reviewer who was already looking at the
+  page.
+- **Extraction is commodity.** Prebuilt document-AI models already cover W-2.
+  Rebuilding that is a poor use of early engineering time.
+- **The validation layer is the defensible work.** A W-2 is an
+  over-determined system — Box 4 follows from Box 3, Box 6 from Box 5, Box 5
+  minus Box 1 from Box 12 deferral codes. That arithmetic gives a correctness
+  signal on *unlabeled production data* with no ground truth required, which
+  is what you'd monitor in production and what points a reviewer's attention
+  at the right box.
 
-Build order follows: rule engine and evaluation harness first, extraction models
-last and swappable.
-
----
-
-## Data
-
-### Primary: `singhsays/fake-w2-us-tax-form-dataset`
-
-2,000 W-2 images with structured ground truth. 1,800 train / 100 validation / 100
-test, ~310 MB. Synthetically generated names, SSNs, EINs and addresses, with real
-city/state/zip combinations. Derived from the Kaggle *Fake W-2 (US Tax Form)
-Dataset*.
-
-Ground truth is Donut `gt_parse` JSON keyed by box:
-
-```json
-{"gt_parse": {
-  "box_b_employer_identification_number": "47-5592725",
-  "box_c_employer_name": "Bennett, Allen and Yang Inc",
-  "box_a_employee_ssn": "412-88-2525",
-  "box_e_employee_name": "Michele...", ...}}
-```
-
-This is a real labeled eval set on real rendered images, which is much better than
-scoring against my own generator. It becomes the primary A/B corpus.
-
-### Experiment 0: are the amounts internally consistent?
-
-**Run this before anything else.** Load the ground truth, compute
-`Box 4 − 0.062 × (Box 3 + Box 7)` and `Box 5 − Box 1 − Σ(Box 12 deferrals)`, and
-plot the distributions.
-
-My hypothesis is that this dataset sampled each box independently, so the FICA
-arithmetic will **not** hold. Either result is useful:
-
-- **If inconsistent** (expected): the rule engine will fire on nearly every
-  document, which is a clean demonstration that it works — and a principled reason
-  to keep a payroll-consistent generator for anything involving training or
-  threshold tuning. Report the fraction of the public dataset that fails each rule.
-  That number is a finding worth putting in the writeup.
-- **If consistent**: the generator becomes far less necessary and I should say so
-  and lean on the public data.
-
-This one script converts "I used a Hugging Face dataset" into "I characterized a
-Hugging Face dataset and found something about it," which is the difference the
-grader is looking for.
-
-### Secondary: the payroll-consistent generator
-
-Still built, for the reasons above. It does **not** sample box values
-independently — it simulates a payroll year and derives every box:
-
-```
-gross
-  − section 125 (health premiums, FSA, HSA)   → reduces Boxes 1, 3, 5
-  + group-term life over $50k (Box 12 C)      → increases Boxes 1, 3, 5
-  = Box 5 (Medicare wages)
-  − traditional elective deferrals (Box 12 D/E/G)  → reduces Box 1 only
-  = Box 1
-Box 3 = min(Box 5, wage base);  Box 4 = 6.2% × (Box 3 + Box 7)
-Box 6 = 1.45% × Box 5 + 0.9% on Box 5 over $200k
-```
-
-Roth deferrals (Box 12 AA) reduce nothing — a real source of Box 5 − Box 1
-confusion, so generate them deliberately. Deferrals must be capped at available
-wages or you produce a negative Box 1, which is impossible on a real W-2.
-
-Its jobs: (1) supply the cases the public set lacks, (2) act as a correctness test
-for the rules — **zero findings on a few thousand clean generated documents**, and
-(3) let seeded-error studies control the injected error exactly.
-
-### What the public dataset does not cover
-
-Worth stating plainly, because a 2k-image single-generator corpus is not a
-production distribution:
-
-| Missing | Why it matters |
-|---|---|
-| Multi-state rows (Boxes 15–20) | Dropping the second state row is a top real failure mode |
-| Box 12 code variety | The Box 5 − Box 1 reconciliation rule is the highest-yield rule in the set |
-| Phone photos, skew, glare, thermal scans | ~20% of assumed real intake |
-| Digital PDFs with a text layer | ~45% of assumed real intake; extracts near-perfectly and must be routed away from OCR |
-| W-2c corrections, 4-up copy sheets | Distinct document handling |
-
-Two mitigations. The Kaggle source includes noise-augmented images alongside clean
-ones — pull those for the OCR-degradation arm. And apply Augraphy
-(print/scan/photocopy artifacts) plus perspective, glare and JPEG noise to generate
-a controlled degradation ladder, so accuracy can be reported *as a function of
-image quality* rather than as a single number.
-
-### Supporting open datasets
-
-- **RVL-CDIP** — 400k document images, 16 classes. For the document-type
-  classifier that decides "is this even a W-2" at intake.
-- **FUNSD / XFUND** — form understanding with key-value and layout annotations.
-  Layout pretraining for LayoutLM-family backbones.
-- **`hsarfraz/donut-irs-tax-docs-classifier`** — Donut fine-tuned on 3,000+ IRS tax
-  documents including W-2, built on `naver-clova-ix/donut-base-finetuned-rvlcdip`.
-  A ready baseline for the intake router.
-
-None of FUNSD, XFUND or RVL-CDIP contain W-2s. Citing them as if they did would be
-misleading; they earn their place as pretraining and classification data only.
-
-### Held to regardless
-
-**Real hand-labeled documents remain the gold eval.** The public set is synthetic
-from a single generator, so strong scores on it prove the model learned that
-generator. Even 50 carefully labeled real documents are worth more as a final
-check.
-
-**Sampling bias:** if ground truth comes only from documents humans reviewed, and
-humans review low-confidence documents, the eval set is biased. Force-sample a
-random slice for full labeling.
+Build order followed from this: rule engine and evaluation harness first,
+extraction models last and swappable behind one protocol.
 
 ---
 
-## The A/B
+## Findings
 
-Four arms, all scored on the same corpus:
+### F1 — The public dataset has systematically wrong FICA arithmetic
 
-| Arm | What it tests |
-|---|---|
-| **Template OCR** (Tesseract/PaddleOCR + coordinate mapping) | Cheap deterministic baseline; should dominate on clean digital PDFs |
-| **Fine-tuned Donut** on the 1.8k train split | The dataset ships in exactly this format — the natural "we trained something" arm |
-| **Hosted prebuilt** (Azure `prebuilt-tax.us.W2`) | Zero-training baseline; the honest question is whether training beats buying |
-| **VLM structured JSON** (Claude / GPT-4-class, prompted to the schema) | Strongest zero-shot, expected to be badly overconfident |
+`singhsays/fake-w2-us-tax-form-dataset`, 2,000 records, is the primary corpus
+this project was scoped around. Before writing any rule, Experiment 0 checked
+whether its amounts satisfy real payroll arithmetic.
 
-**Shadow, paired, not split traffic.** Documents are asynchronous and cheap to
-re-score, so every arm scores every document. Paired differences give far tighter
-intervals on the same sample.
+**The false start.** The naive check —
+`Box4 − 0.062×(Box3+Box7)` and `Box5 − Box1 − ΣBox12 deferrals` — looked
+conclusive: 0/2000 passed on both. That result was wrong. Formula B straddled
+zero with a huge spread, consistent with unrelated random values. Formula A
+did not: every record was short, never over, tight spread relative to the
+mean — one-sidedness that clean is structure, not noise. The cause was a
+defect in a *different* field: `Box7 ≡ Box3` and `Box8 ≡ Box5` in all 2,000
+records (the generator copies tips rather than generating them), so
+`Box3+Box7` double-counts wages and the residual is forced negative
+regardless of whether Box 4 is correct. **The tell was the sign distribution,
+not the pass rate.**
 
-Reported per arm: field accuracy, critical-field accuracy, materiality-weighted
-escape rate, reviewer-minutes per document, cost and p95 latency per document,
-risk-coverage AUC, and an error taxonomy.
+**What's actually true.** Re-tested on ratios, including `Box6/Box5`, which
+no duplicated field touches: `Box4/Box3` = 0.076500 and `Box6/Box5` = 0.029000,
+**zero variance**, across all 2,000 records. Box 4 = `round(0.0765×Box3)` and
+Box 6 = `round(0.029×Box5)` hold to the cent in 1,998/2,000 records. The
+coefficients aren't arbitrary: **0.0765 = 0.062 + 0.0145**, the combined
+employee FICA rate applied where only the SS component belongs; **0.029 =
+2×0.0145**, the employer+employee Medicare rate applied where only the
+employee share belongs. Both are the same class of error — the wrong rate
+from the right family — deterministic and reproducible, not noise.
 
-**Risk-coverage AUC is the metric most likely to change the decision.** It measures
-whether confidence scores carry information at all. Expect the realistic signature:
-the VLM scores higher raw accuracy but is badly overconfident, so no threshold
-lets you trust its confidence to prioritize anything. Under mandatory sign-off,
-confidence is what rations reviewer attention — selecting on field accuracy alone
-picks the wrong arm. The harness should print that inversion explicitly.
+**The more serious defect: no wage base cap.** Box 3 exceeds the 2024 SS wage
+base ($168,600) in 753/2000 records (37.7%) and the 2025 base ($176,100) in
+695/2000 (34.8%), with zero cap effect on Box 4 at either threshold. A wrong
+rate is a recoverable constant factor — divide it out. **A missing cap
+destroys information**: real Box 3 is `min(wages, base)`, which cannot be
+inverted once capped. Those ~695 records aren't merely wrong, they're
+structurally impossible.
 
-**The reviewer model encodes automation bias.** A reviewer facing a prefilled form
-with a green checkmark approves without reading; one whose attention is pointed at
-a flagged box catches far more. Those two catch probabilities are the least
-defensible numbers in the project and they drive the headline metric — which is why
-`seeded_error_study.py` exists: inject known-bad values into a random share of the
-queue and measure the real catch rate, split by whether the rule engine flagged the
-field. Ship that instrumentation on day one so the assumption is falsifiable rather
-than load-bearing and invisible.
+**Consequence:** anyone fine-tuning an extraction model on this corpus is
+teaching it a wrong tax world — that Box 4 is always 7.65% of Box 3 and Box 3
+has no ceiling — and the model will reproduce that faithfully. This is the
+concrete argument for keeping validation downstream of extraction regardless
+of extractor quality, and it's why F1 prompted `BOX3_EXCEEDS_BOX1_UNEXPLAINED`
+and the payroll-consistent generator both.
 
-Escape rate is weighted by dollar materiality throughout. Unweighted, a two-cent
-rounding difference counts the same as a $4,000 error.
+### F2 — The rule engine, validated against real data before being written
+
+Every rule was checked against `scripts/score_public_dataset.py`'s fire rates
+before shipping, and the acceptance target — **zero findings across 23,000
+generated documents spanning 21 seeds** — was met after fixing two real bugs
+the acceptance test and rule-design review surfaced (a generator bug that
+produced degenerate near-zero Box 1 values for low earners, and the
+`flat_fields()` collision below).
+
+| Rule | Severity | Fire rate |
+|---|---|---|
+| `SS_TAX_MISMATCH` | CRITICAL | 2000/2000 (100.0%) |
+| `MEDICARE_TAX_MISMATCH` | CRITICAL | 2000/2000 (100.0%) |
+| `SS_WAGE_BASE_EXCEEDED` | CRITICAL | 1549/2000 (77.5%) |
+| `BOX5_BOX1_UNEXPLAINED` | ERROR | 2000/2000 (100.0%) |
+| `BOX1_EXCEEDS_BOX5` | CRITICAL | 1045/2000 (52.2%) |
+| `BOX3_EXCEEDS_BOX1_UNEXPLAINED` | ERROR | 901/2000 (45.1%) |
+| `NEGATIVE_AMOUNT` | CRITICAL | 0/2000 (0.0%) |
+| `FED_TAX_EXCEEDS_WAGES` | CRITICAL | 0/2000 (0.0%) |
+| `SSN_MALFORMED` / `SSN_INVALID_AREA` / `SSN_INVALID_GROUP_SERIAL` | CRITICAL | 0/2000 (0.0%) |
+| `EIN_MALFORMED` | CRITICAL | 0/2000 (0.0%) |
+| `BOX12_INVALID_CODE` | ERROR | 0/2000 (0.0%) |
+| `BOX12_OVER_402G` | WARN | 0/2000 (0.0%) |
+| `BOX12_DUPLICATE_CODE` | WARN | 611/2000 (30.6%) |
+| `BOX13_RETIREMENT_INCONSISTENT` | WARN | 1238/2000 (61.9%) |
+| `NO_TAX_STATE_WITHHOLDING` | ERROR | 701/2000 (35.0%) |
+| `STATE_WAGES_OUT_OF_BAND` | WARN | 0/2000 (0.0%) |
+| `STATE_TAX_IMPLAUSIBLE` | ERROR | 0/2000 (0.0%) |
+
+`SS_WAGE_BASE_EXCEEDED` at 77.5% is not the ~35% Box 3 alone would suggest.
+The rule checks Box 3 + Box 7 per spec, and Box 7 ≡ Box 3 in every record
+(F1's tips-duplication artifact), so the checked total is effectively 2×
+Box 3 — a rule-input artifact carried over from F1, not a new rule bug.
+`BOX1_EXCEEDS_BOX5` at a near-coin-flip 52.2% is independent confirmation,
+from the rule-firing side, of F1's conclusion that Box 1 and Box 5 are drawn
+independently in this dataset. Every identifier/format rule sits at 0%,
+because the generator (Faker) produces well-formed SSNs, EINs, and
+plausible Box 12 amounts — this corpus validates the rule engine's
+arithmetic layer and nothing else.
+
+### F3 — Extraction arm comparison: a calibration inversion, and cost bought with escapes
+
+2,000 documents from `w2.generate`, scored paired across three simulated
+backends (`scripts/run_eval.py`, seed 2024):
+
+| ARM | FIELD ACC | CRIT ACC | ESC/DOC | REV MIN | COST | P95 LAT | RC-AUC |
+|---|---|---|---|---|---|---|---|
+| `hosted_prebuilt` | 98.4% | 97.6% | 0.170 | 1.78m | $1.50 | 1217ms | 0.0003 |
+| `vlm_structured` | 99.0% | 98.7% | 0.104 | 1.68m | $4.00 | 2628ms | 0.0022 |
+| `template_ocr` | 95.5% | 93.5% | 0.469 | 2.25m | $0.05 | 301ms | 0.0020 |
+
+ESC/DOC is escaped material errors per document (expected value under the
+reviewer model, see F5). RC-AUC is area under the risk-coverage curve; lower
+means confidence actually separates that arm's own right answers from wrong
+ones.
+
+`vlm_structured` has the best field accuracy (99.0%) but the worst RC-AUC
+(0.0022, ~7x `hosted_prebuilt`'s 0.0003) — a strict calibration inversion,
+confirmed programmatically. Its confidence barely separates correct from
+incorrect fields, so a confidence threshold can't be trusted to prioritize
+review. Under mandatory sign-off, confidence is what rations reviewer
+attention, so selecting `vlm_structured` on field accuracy alone picks the
+wrong arm.
+
+The cost tradeoff, stated in dollars: `template_ocr` is **80x cheaper** than
+`vlm_structured` ($0.05 vs. $4.00/doc) and buys that with **0.365 additional
+escaped errors per document** (0.469 − 0.104). Per-error escape probability
+is similar across all three arms (51–52%); the gap is almost entirely a
+volume effect — `template_ocr` produces 1,814 material errors on this corpus
+against `vlm_structured`'s 400, not a worse per-error catch rate.
+
+### F4 — Seeded-error study: what the rule engine actually catches
+
+8,000 documents, one injected error each, across Box 1–6 and SSN/EIN
+(`scripts/seeded_error_study.py`, seed 777). **Flag rate is measured
+directly** — real output of `rules.validate` on real corrupted records.
+
+| FIELD | N | FLAG RATE | ESCAPE RATE |
+|---|---|---|---|
+| wages_box1 | 905 | 96.0% | 20.0% |
+| **fed_income_tax_box2** | 996 | **13.7%** | 25.5% |
+| ss_wages_box3 | 948 | 96.7% | 20.0% |
+| ss_tax_box4 | 953 | 95.2% | 20.0% |
+| medicare_wages_box5 | 994 | 97.1% | 20.0% |
+| medicare_tax_box6 | 945 | 92.6% | 20.0% |
+| **ssn** | 1116 | 56.4% | 46.2% |
+| ein | 1143 | 53.5% | 47.9% |
+
+Flag rate, not escape rate, is the number to trust here — Box 2 shows why.
+Its escape rate (25.5%) looks *better* than SSN's (46.2%), which would
+suggest Box 2 is fine. Breaking it down by corruption type shows that's a
+dollar-weighting artifact: decimal-shift Box 2 errors average $759,961 in
+apparent size and get caught 44.2% of the time (they blow past Box 1 and
+trip `FED_TAX_EXCEEDS_WAGES`), while dropped/OCR/transposition Box 2 errors —
+still real $10–34k mistakes — are caught **0.0–0.9%** of the time. The rare,
+huge, easily-caught errors dominate the dollar-weighted average and hide that
+the ordinary Box 2 error survives review almost every time it happens.
+
+**Ranked by flag rate, the three worst-covered fields are `fed_income_tax_box2`
+(13.7%), `ein` (53.5%), `ssn` (56.4%)** — dramatically worse than every
+arithmetic-linked money field (92.6–97.1%). This empirically confirms, for
+the first time rather than by reasoning about it, both gaps this project
+flagged as concerns from the start: Box 2 is invisible to arithmetic, and SSN
+structural validation catches almost nothing.
+
+### F5 — Two bugs in the measuring instrument
+
+Both were in code that measures the system, not in the system being
+measured — worth calling out on its own, because a bug in the instrument is
+worse than a bug in the thing measured: it doesn't announce itself. A bad
+rule fires visibly; a bad metric just quietly reports a plausible, wrong
+number.
+
+**1. `flat_fields()` Box 12 collision.** The schema flattened repeated Box 12
+rows to `box12[<code>]_amount`, keyed on code alone. A record with three `E`
+entries — common on the public corpus, 611/2,000 records duplicate a code —
+collapsed to one dict entry, silently dropping two real amounts. This isn't
+just a labeling bug: `flat_fields()` is what an eval harness diffs truth
+against prediction on, so two real amounts would never enter the scoring
+denominator, and a score computed against a shrunk denominator looks better
+than it is. Fixed by numbering entries within a duplicated code, ordered by
+amount descending (Box 12 slot position carries no meaning, so an extractor
+returning the same rows in a different order must not score as an error).
+
+**2. The escape-rate denominator.** The original `materiality_weighted_escape_rate`
+normalized by total dollars across all material errors — a per-*error*
+metric, not a per-*document* one. That choice normalized away error volume:
+it reported 20.3–20.4% for all three F3 arms, making them look nearly
+identical on escape risk. They are not — `template_ocr` produces 4.5x more
+material errors per document than `vlm_structured` on the same corpus. Fixed
+by making escapes-per-document the headline metric (F3's ESC/DOC column),
+keeping the dollar-weighted view as a secondary diagnostic.
+
+Neither bug was caught by eyeballing output that looked reasonable — both
+were caught by asking what denominator a ratio actually used and checking it
+against a hand-built case with a known answer.
 
 ---
 
-## Other assumptions
+## What's measured vs. what's assumed
 
-**A1 — Direction of flow.** A tax-prep/CPA firm whose clients *send W-2s in* for
-1040 preparation. The alternative reading — a firm that *issues* W-2s for client
-employees — is a generation-and-SSA-filing system (EFW2, BSO, W-3 transmittal) with
-no extraction at all. The intake → extraction → follow-up shape only makes sense
-for inbound documents. *If wrong:* the rule engine survives as a pre-filing gate,
-which is why it has no dependency on the extractors.
+- **Measured:** every fire rate in F2 and F3's field-accuracy/RC-AUC/cost/
+  latency numbers (real output of `rules.validate` and the simulated
+  backends' error models). Every flag rate in F4.
+- **Assumed:** every escape-rate number anywhere in this document rests on
+  two constants at the top of `w2/evaluate.py` —
+  `REVIEWER_CATCH_RATE_FLAGGED` (0.80) and `REVIEWER_CATCH_RATE_UNFLAGGED`
+  (0.20) — plus `REVIEWER_BASE_MINUTES` / `REVIEWER_MINUTES_PER_FLAGGED_FIELD`
+  for reviewer-minutes. These encode automation bias (a reviewer facing a
+  flagged field reads carefully; one facing an unflagged field in an
+  otherwise-clean form doesn't) but are stated numbers, not measurements.
+  `scripts/seeded_error_study.py` is the instrument built to eventually
+  replace them with real reviewer data — it doesn't replace them yet, since
+  F4's escape-rate column still assumes the same two constants rather than
+  measuring an actual human.
+- **Simulated:** the three extraction backends in `w2/backends.py` are
+  documented simulations driven by explicit error models (digit
+  transposition, OCR confusion, decimal shift, dropped/hallucinated rows),
+  not real models or APIs — no real extractor exists yet. They implement
+  `extract_from_truth(record, rng)`, which is not part of the real `Backend`
+  protocol (a real backend has no ground truth to peek at). A real backend
+  implements `extract(image)` only, and swaps in behind `Backend` with no
+  other change to `evaluate.py` or `run_eval.py` — the call site is the only
+  thing that changes.
 
-**A2 — Intake mix.** Roughly 10–40k W-2s per season in a compressed
-January–April window: ~45% digital payroll-provider PDFs, ~30% scans, ~20% phone
-photos, ~5% unusable. **The load-bearing decision is to route on whether a text
-layer exists before choosing a model.** The digital-PDF share extracts at near-100%
-for near-zero cost; OCRing it anyway is the most common way these systems waste
+---
+
+## Assumptions
+
+**Direction of flow.** A tax-prep/CPA firm whose clients *send* W-2s in for
+1040 preparation, not a firm issuing W-2s (which would be an EFW2/BSO filing
+system with no extraction at all). If wrong, the rule engine survives as a
+pre-filing gate — it has no dependency on the extractors.
+
+**Intake mix.** Roughly 10–40k W-2s per season in a compressed January–April
+window: ~45% digital payroll-provider PDFs, ~30% scans, ~20% phone photos,
+~5% unusable. The load-bearing decision is routing on whether a text layer
+exists before choosing a model — the digital-PDF share extracts near-100% for
+near-zero cost, and OCRing it anyway is a common way these systems waste
 money and introduce errors that were never in the document.
 
-**A3 — Completeness is the hard problem, and it is not the W-9 problem.** With W-9s
-the denominator is known: AP has a vendor list, so you know who owes you a form.
-With W-2s there is no denominator — if a client sends two, nothing tells you
-whether there was a third job. Three sources, descending reliability:
+**Completeness has no denominator, unlike a W-9.** With W-9s, AP has a vendor
+list — the firm knows who owes a form. With W-2s there's no such list: if a
+client sends two, nothing says whether there was a third job. Three sources,
+descending reliability: (1) IRS Wage & Income transcript — true ground truth,
+but not reliably complete until well after the filing deadline, so it's a
+post-filing reconciliation trigger, not an in-season check; (2) prior-year
+rollforward — cheap, available in January, the in-season workhorse, assumes
+~85% returning clients; (3) secondary signals (a state return implying wages
+not on file, a Box 12 code implying an unmentioned plan).
 
-1. **IRS Wage & Income transcript** (signed Form 8821 or 2848, via e-Services/TDS).
-   True ground truth. **Caveat:** not reliably complete until well after the filing
-   deadline, so it is a post-filing reconciliation and amended-return trigger, not
-   an in-season check. Assuming otherwise would be the biggest available design
-   error.
-2. **Prior-year rollforward.** Chase any EIN present last year and missing this
-   year. Cheap, available in January, correct most of the time. The in-season
-   workhorse.
-3. **Secondary signals.** A state return implying wages we don't have; an organizer
-   answer; a Box 12 code D implying a plan the client never mentioned.
-
-Assumes ~85% returning clients. New clients have no denominator at all, and the
-honest answer is an explicit attestation, not an inference.
-
-**A4 — Security is non-negotiable.** Every W-2 is an SSN plus a full wage record.
-GLBA Safeguards Rule, IRS Pub 4557, and a written information security plan for any
-PTIN holder. Consequences: the follow-up agent **always** directs to a secure upload
-link and **never** invites an email attachment; any third-party model API touching
-document images needs zero-retention terms in writing first; field-level provenance
-exists so that after a bad model version ships you can answer which documents were
-affected.
+**Security is non-negotiable.** Every W-2 is an SSN plus a full wage record —
+GLBA Safeguards Rule and IRS Pub 4557 apply. Follow-up always directs to a
+secure upload link, never an email attachment; any third-party model API
+touching document images needs zero-retention terms in writing first;
+field-level provenance (the `Field` wrapper's `source`) exists so a bad model
+version's blast radius is answerable after the fact.
 
 ---
 
-## Architecture
+## Known gaps, and what I'd build next
 
-```
-w2/
-  constants.py   per-tax-year IRS tables: wage base, 402(g), catch-ups,
-                 valid Box 12 codes, no-income-tax states
-  schema.py      canonical record; every value carries confidence + model version + bbox
-  datasets.py    HF loader, gt_parse → canonical schema adapter, degradation ladder
-  generate.py    payroll simulator for synthetic W-2s
-  rules.py       declarative validation rules with severity and tolerance
-  backends.py    Backend protocol + the four extraction arms
-  evaluate.py    paired harness, reviewer model, risk-coverage curves
-  chase.py       document state machine, follow-up cadence, completeness reconciliation
-scripts/
-  check_dataset_consistency.py   Experiment 0
-  run_eval.py                    arm comparison table
-  seeded_error_study.py          measures what the rule engine is worth
-tests/
-```
+In priority order, driven by what F3/F4 actually measured rather than a
+priori guessing:
 
-### Non-negotiable conventions
-
-- **Money is integer cents.** Floats in a tax system are a correctness bug waiting
-  to happen. The HF ground truth is strings with dollar signs and commas — parse to
-  cents at the adapter boundary, once.
-- **Per-year constant tables, never inline literals.** Every threshold on a W-2
-  changes annually. An unknown tax year must raise loudly, not silently pass.
-- **Repeated rows key on their natural key, never position.** Box 12 rows key on the
-  code, state rows on the state code. Positional keying makes one dropped row look
-  like an error in every row after it — it inflates error rates and hides the real
-  failure mode.
-- **Every value is a `Field`, not a scalar** — value, confidence, source model
-  version, pixel bbox. Without the bbox you can't build a review UI a human can
-  trust. Without the version you can't do incident response.
-
-### Validation rules
-
-Arithmetic: Box 4 from Box 3 + Box 7; Box 6 from Box 5 including additional
-Medicare; Box 3 + Box 7 within the annual wage base; Box 5 − Box 1 explained by
-Box 12 deferral codes (highest-yield rule — catches digit errors in either box plus
-dropped and hallucinated Box 12 rows at once); no negative amounts; Box 2 not
-exceeding Box 1.
-
-Identifiers: SSN structurally issuable (no 000/666/9xx area, no 00 group, no 0000
-serial; 9xx is an ITIN, never valid on a W-2); EIN well-formed.
-
-Box 12/13: codes valid for the tax year; deferrals within 402(g) plus the largest
-applicable catch-up; no duplicated codes; Box 13 consistent with Box 12.
-
-State: no Box 17 withholding in no-income-tax states; Box 16 total in a loose band
-around Box 1 (loose and warning-only on purpose — PA taxes 401(k) deferrals, so
-state and federal wage bases legitimately differ); Box 17 plausible against Box 16.
-
-Each rule carries an ID, severity, tolerance, a human-readable message, and **the
-specific field names involved**, so the review UI can highlight exact boxes.
-
-### Follow-up loop
-
-`EXPECTED → REQUESTED → RECEIVED → EXTRACTED → FLAGGED → READY_FOR_REVIEW →
-SIGNED_OFF`, plus `SUPERSEDED` (W-2c or better scan) and `ABANDONED` (client
-confirms the job didn't exist). Illegal transitions raise.
-
-Cadence escalates over four touches across ~4 weeks rather than nagging weekly;
-the final touch requires human approval, then stop and escalate to the relationship
-owner. Dedupe on `(SSN, EIN, tax year)` — Copy B, C and 2 are the same document and
-clients re-upload clearer photos; keep the highest-confidence version. Review queue
-orders by **expected dollar impact of an error**, not upload time.
-
----
-
-## Known gaps, stated up front
-
-- **Box 2 (federal withholding) is invisible to arithmetic.** No cross-field
-  constraint exists on a W-2 — it depends on W-4 elections — so it falls back
-  entirely on unaided human attention. That is a wrong refund. Needs a plausibility
-  band from an effective-rate model, or a second independent extraction with a
-  disagreement check.
-- **SSN structural validation catches almost nothing.** Change one digit of a valid
-  SSN and you usually get another valid SSN. The real control is name/SSN matching
-  against the prior-year return, the client record, or IRS TIN matching — not a
-  regex. Shipping the regex and *believing SSNs are covered* is the dangerous
-  outcome.
-- **W-2c corrections** — out of scope for v1. `SUPERSEDED` exists; the parser
-  doesn't.
-- **Multi-form page segmentation** — Copy B/C/2 print 4-up. Partially handled at
-  dedupe, which is not a full answer.
-- **W-3 / 941 cross-document reconciliation** — belongs to the payroll-filer
-  reading of A1. Highest-value addition if the firm also does payroll.
-
----
-
-## Build order
-
-1. `constants.py`, `schema.py` — foundations everything types against.
-2. `datasets.py` + `check_dataset_consistency.py` — load the HF set, adapt
-   `gt_parse` to the canonical schema, run Experiment 0. **Do this before writing
-   any rule**, because the answer determines how much the generator matters.
-3. `generate.py` + `rules.py` together, until zero false positives on clean
-   generated documents.
-4. `evaluate.py` + `seeded_error_study.py` — the harness.
-5. `chase.py` — state machine and completeness reconciliation.
-6. The four extraction arms behind the `Backend` protocol; re-run the harness
-   unchanged.
-7. A control for Box 2, then name/SSN matching — the two largest uncovered
-   exposures.
-
----
-
-## Production architecture (design only, not v1)
-
-Immutable artifacts in object storage with content-hash IDs. Durable orchestration
-with human-in-the-loop wait states — Temporal handles multi-week chase timers well.
-Field-level provenance so every value traces to a model version and a pixel region.
-Per-year rule configuration versioned alongside the constant tables, so a January
-threshold change is a config commit rather than a deploy.
-
----
-
-## Open questions
-
-1. What is the **real intake mix**? If it's 90% phone photos, preprocessing becomes
-   the main investment and the cost model above is wrong.
-2. What fraction of clients are **returning**? Rollforward is the entire in-season
-   completeness strategy and only works for them.
-3. Does the firm hold **8821/2848 authorizations** at scale? Determines whether
-   transcript reconciliation is available at all.
-4. What is the **measured** unflagged catch rate in review? If it's low, the finding
-   is that the review queue isn't the safety net the firm believes it is — and the
-   fix is the UI, not the model.
+1. **A Box 2 plausibility control.** F4 measured this as the single
+   worst-covered field (13.7% flag rate) — no arithmetic constraint exists on
+   Box 2 on a real W-2, so it falls back entirely on unaided human attention,
+   which the seeded-error study now shows is close to a coin flip for
+   anything short of a catastrophic error. Needs a plausibility band from an
+   effective-rate model or a second independent extraction with a
+   disagreement check.
+2. **Name/SSN matching**, not just structural validation. F4 measured SSN at
+   56.4% flag rate — better than Box 2 but still the second-worst field, and
+   structural validation catches almost nothing by construction (change one
+   digit of a valid SSN and you usually get another valid SSN). The real
+   control is matching against the prior-year return, the client record, or
+   IRS TIN matching.
+3. **Real reviewer data for `REVIEWER_CATCH_RATE_*`.** Every escape-rate
+   number in this document is conditional on two assumed constants (see
+   "What's measured vs. assumed"). Running the seeded-error-study
+   methodology against actual human reviewers, not the assumed constants,
+   turns every escape-rate number here from a projection into a measurement.
+4. **The four real extraction arms behind `Backend`.** F3 measured the
+   *shape* of a calibration inversion using simulated error models; the real
+   question — does a real hosted API or a real VLM actually produce that
+   inversion — needs `extract(image)` implementations. The harness is
+   already built to swap them in with no other change.
+5. **`chase.py`** — the document state machine and follow-up cadence
+   (`EXPECTED → REQUESTED → RECEIVED → EXTRACTED → FLAGGED →
+   READY_FOR_REVIEW → SIGNED_OFF`, plus `SUPERSEDED`/`ABANDONED`) and the
+   completeness reconciliation logic. Not started.
+6. **W-2c corrections and 4-up copy-sheet segmentation.** Out of scope for
+   v1; `SUPERSEDED` exists as a state but the parser doesn't.
+7. **W-3/941 cross-document reconciliation.** Only relevant if the firm also
+   runs payroll for clients — a different reading of "direction of flow"
+   than the one this project assumes.
