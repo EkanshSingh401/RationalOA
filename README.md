@@ -3,7 +3,7 @@
 Ingestion → extraction → validation → human review → downstream output, for a tax
 preparation firm receiving W-2s from clients.
 
-**Status: design agreed, implementation not started.** This README is the spec.
+This README is the spec.
 Everything below is a decision I made and can defend; "Open questions" at the
 bottom lists what I would change my mind about given real data.
 
