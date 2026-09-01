@@ -115,10 +115,7 @@ def _generate_box12(rng: random.Random, tax_year, available_wages_cents: int) ->
     return entries, traditional_total
 
 
-def _generate_state_row(rng: random.Random, tax_year, box1_cents: int) -> StateRow:
-    state = rng.choice(STATES)
-    factor = Decimal(str(round(rng.uniform(0.70, 1.30), 4)))
-    state_wages = int(Decimal(box1_cents) * factor)
+def _make_state_row(rng: random.Random, tax_year, state: str, state_wages: int) -> StateRow:
     if state in tax_year.no_income_tax_states:
         state_tax = 0
     else:
@@ -130,6 +127,29 @@ def _generate_state_row(rng: random.Random, tax_year, box1_cents: int) -> StateR
         state_wages=_field(state_wages),
         state_income_tax=_field(state_tax),
     )
+
+
+def _generate_state_rows(rng: random.Random, tax_year, box1_cents: int) -> List[StateRow]:
+    """One state row most of the time, two ~35% of the time (a mid-year
+    move or a second job) -- multi-state records are a real, common case
+    the single-row HF public corpus never exercises, and the backends'
+    "dropped second state row" error model needs a second row to drop.
+    """
+    n_rows = 2 if rng.random() < 0.35 else 1
+    total_factor = Decimal(str(round(rng.uniform(0.70, 1.30), 4)))
+    total_state_wages = int(Decimal(box1_cents) * total_factor)
+    states = rng.sample(STATES, k=n_rows)
+
+    if n_rows == 1:
+        return [_make_state_row(rng, tax_year, states[0], total_state_wages)]
+
+    first_share = rng.uniform(0.5, 0.9)
+    first_wages = int(total_state_wages * first_share)
+    second_wages = total_state_wages - first_wages
+    return [
+        _make_state_row(rng, tax_year, states[0], first_wages),
+        _make_state_row(rng, tax_year, states[1], second_wages),
+    ]
 
 
 def generate_w2(rng: random.Random, tax_year_value: int) -> W2Record:
@@ -199,7 +219,7 @@ def generate_w2(rng: random.Random, tax_year_value: int) -> W2Record:
         nonqualified_plans_box11=_field(box11),
         box13_retirement_plan=_field(box13_retirement),
         box12=box12,
-        state_rows=[_generate_state_row(rng, tax_year, box1)],
+        state_rows=_generate_state_rows(rng, tax_year, box1),
     )
 
 
