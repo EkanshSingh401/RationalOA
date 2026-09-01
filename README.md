@@ -23,9 +23,16 @@ that generator rather than the public corpus.
 
 ```bash
 git clone <this-repo> && cd RationalOA
-pip install -r requirements.txt
-pytest
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pytest
 ```
+
+Use `python3` for the venv step — bare `python` doesn't exist on stock macOS.
+Once the venv is active, `python`/`pip` inside it are already the right
+interpreter. Verified on Python 3.14.3; `requirements.txt` is pinned loosely
+enough to also install on 3.11/3.12.
 
 56 tests, no network access required except the two commands below that load
 the Hugging Face dataset.
